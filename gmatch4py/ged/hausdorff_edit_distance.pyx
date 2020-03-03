@@ -17,14 +17,21 @@ cdef class HED(Base):
     cdef int node_ins
     cdef int edge_del
     cdef int edge_ins
+    cdef float alpha
+    cdef float beta
+    cdef float edge_distance
 
-    def __init__(self, int node_del=1, int node_ins=1, int edge_del=1, int edge_ins=1):
+    def __init__(self, int node_del=1, int node_ins=1, int edge_del=1, int edge_ins=1, 
+                float alpha=0.5, float beta=0.5, float edge_distance=0.1):
         """Constructor for HED"""
         Base.__init__(self,1,False)
         self.node_del = node_del
         self.node_ins = node_ins
         self.edge_del = edge_del
         self.edge_ins = edge_ins
+        self.alpha = alpha
+        self.beta = beta
+        self.edge_distance = edge_distance
 
 
     cpdef np.ndarray compare(self,list listgs, list selected):
@@ -42,7 +49,41 @@ cdef class HED(Base):
                 comparison_matrix[j, i] = comparison_matrix[i, j]
 
         return comparison_matrix
-
+    
+    cpdef np.ndarray compare_block(self, list listgs, int s_x, int e_x, int
+                                                                s_y, int e_y):
+        cdef int x_range = e_x - s_x
+        cdef int y_range = e_y - s_y
+        cdef np.ndarray comparison_matrix = np.zeros((x_range, y_range)).astype(float)
+        cdef int i,j
+        for i in range(s_x, e_x):
+            for j in range(s_y, e_y):
+                g1,g2=listgs[i],listgs[j]
+                comparison_matrix[i-s_x, j-s_y] = self.hed(g1, g2) 
+        return comparison_matrix
+        
+    cpdef np.ndarray compare_diagonal(self, list listgs, int s_x, int e_x, int
+                                                                s_y, int e_y):
+        cdef int x_range = e_x - s_x
+        cdef int y_range = e_y - s_y
+        cdef np.ndarray comparison_matrix = np.zeros((x_range, y_range)).astype(float)
+        cdef int i,j
+        for i in range(s_y, e_y):
+            for j in range(i, e_x):
+                g1,g2=listgs[i],listgs[j]
+                comparison_matrix[j-s_y, i-s_y] = self.hed(g1, g2) 
+        return comparison_matrix
+                
+    cpdef np.ndarray compare_test_train(self, list test, list train):
+        cdef int ntest = len(test)
+        cdef int ntrain = len(train)
+        cdef np.ndarray comparison_matrix = np.zeros((ntest, ntrain)).astype(float)
+        cdef int i,j
+        for i in range(ntest):
+            for j in range(ntrain):
+                g1,g2=test[i],train[j]
+                comparison_matrix[i, j] = self.hed(g1, g2) 
+        return comparison_matrix
 
     cdef float hed(self, g1, g2):
         """
@@ -51,7 +92,12 @@ cdef class HED(Base):
         :param g2: second graph
         :return:
         """
-        return self.sum_fuv(g1, g2) + self.sum_fuv(g2, g1)
+        # FLW add lower bound to avoid too strong underestimation
+        estimate = self.sum_fuv(g1, g2) + self.sum_fuv(g2, g1)
+        node_diff = np.abs(len(list(g1.nodes)) - len(list(g2.nodes)))
+        edge_diff = np.abs(len(list(g1.edges)) - len(list(g2.edges)))
+        lower_bound = node_diff + edge_diff 
+        return np.max([estimate, lower_bound])
 
     cdef float sum_fuv(self, g1, g2):
         """
@@ -72,6 +118,13 @@ cdef class HED(Base):
             min_sum[i] = np.min(min_i)
         return np.sum(min_sum)
 
+    # FLW
+    cdef float substitution_cost(self, g1, n1, n2):
+        std = g1.graph['std']
+        x = self.beta * std[0] * (n1[0] - n2[0])**2
+        y = (1 - self.beta) * std[1] * (n1[1] - n2[1])**2
+        return np.sqrt(x + y)
+
     cdef float fuv(self, g1, g2, n1, n2):
         """
         Compute the Node Distance function
@@ -82,13 +135,15 @@ cdef class HED(Base):
         :return:
         """
         if n2 == None:  # Del
-            return self.node_del + ((self.edge_del / 2.) * g1.degree(n1))
+            return self.alpha * self.node_del + ((1-self.alpha) * (self.edge_del / 2.) * g1.degree(n1))
         if n1 == None:  # Insert
-            return self.node_ins + ((self.edge_ins / 2.) * g2.degree(n2))
+            return self.alpha * self.node_ins + ((1-self.alpha) * (self.edge_ins / 2.) * g2.degree(n2))
         else:
             if n1 == n2:
                 return 0
-            return (self.node_del + self.node_ins + self.hed_edge(g1, g2, n1, n2)) / 2
+            else:
+                return ((self.alpha * self.substitution_cost(g1, n1, n2) +
+                        (1-self.alpha) * self.hed_edge(g1, g2, n1, n2)) / 2)
 
     cdef float hed_edge(self, g1, g2, n1, n2):
         """
@@ -99,7 +154,7 @@ cdef class HED(Base):
         :param n2: node of the second graph
         :return:
         """
-        return self.sum_gpq(g1, n1, g2, n2) + self.sum_gpq(g1, n1, g2, n2)
+        return self.sum_gpq(g1, n1, g2, n2) + self.sum_gpq(g2, n2, g1, n1)
 
 
     cdef float sum_gpq(self, g1, n1, g2, n2):
@@ -122,11 +177,11 @@ cdef class HED(Base):
         for i in range(len(edges1)):
             min_i = np.zeros(len(edges2))
             for j in range(len(edges2)):
-                min_i[j] = self.gpq(edges1[i], edges2[j])
+                min_i[j] = self.gpq(edges1[i], edges2[j], n1, n2)
             min_sum[i] = np.min(min_i)
         return np.sum(min_sum)
 
-    cdef float gpq(self, tuple e1, tuple e2):
+    cdef float gpq(self, tuple e1, tuple e2, n1, n2):
         """
         Compute the edge distance function
         :param e1: edge1
@@ -138,6 +193,15 @@ cdef class HED(Base):
         if e1 == None:  # Insert
             return self.edge_ins
         else:
-            if e1 == e2:
+            # FLW - edge substitutions need to happen, if we replace n2 with n1 and they are not connected with eachother via a third node n3
+            alternate_n1 = [f for f in e1 if f != n1][0]
+            alternate_n2 = [f for f in e2 if f != n2][0]
+            distance = np.sqrt((alternate_n1[0] - alternate_n2[0])**2 + (alternate_n1[1] - alternate_n2[1])**2)
+            # TODO: think about better distance
+            if distance < self.edge_distance:
                 return 0
-            return (self.edge_del + self.edge_ins) / 2.
+            else:
+                return (self.edge_del + self.edge_ins) / 2.
+           # if e1 == e2:
+           #     return 0
+           # return (self.edge_del + self.edge_ins) / 2.
